@@ -87,10 +87,24 @@ typedef struct
     float thrust;
     float vx_set_mps;            /* 上位机 ID 84 期望前向速度，单位 m/s，向前为正 */
     float vy_set_mps;            /* 上位机 ID 84 期望右向速度，单位 m/s，向右为正 */
+    uint32_t velocity_echo_ms;  /* 上位机回显的飞控 yaw 采样时间，单位 ms */
     uint32_t velocity_update_ms; /* 最近一次接收有效水平速度指令的本机时间，单位 ms */
     uint32_t velocity_rx_count;  /* 自清零以来接收的有效水平速度指令数 */
 
 } PC_Data_t;//来自PC的数据
 const ELRS_Data *get_remote_control_point(void);
 const PC_Data_t *get_pc_data_point(void);
+
+typedef struct
+{
+    mavlink_heartbeat_t payload;
+    uint32_t update_ms;
+    uint32_t rx_count;
+    uint8_t sysid;
+    uint8_t compid;
+} MavlinkHeartbeatRx_t;
+
+/* 任务上下文复制 USART3 最近一次接收的心跳。尚未收到心跳时返回 false。 */
+bool mavlink_get_heartbeat_snapshot(MavlinkHeartbeatRx_t *out);
+
 #endif // MAVLINK_H

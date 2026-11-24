@@ -1077,7 +1077,7 @@ static void Flip_Controller_Reset(
         ->IMU_data
         ->INS_angle[0];
 }
-/* 已有右杆给定时，用近期 ID 84 的整对机体速度覆盖；两轴共用遥杆的速度上限。 */
+/* 读取有效的 ID 248 水平速度给定，两轴共用速度上限。 */
 static void Flow_Apply_PC_Velocity(const PC_Data_t *pc, float *vx, float *vy)
 {
     taskENTER_CRITICAL();
@@ -1185,31 +1185,23 @@ static float Flow_Run_Thrust(const OpticalFlow_Data_t *flow, float throttle)
 void aricraft_behaviour_mode_set(
     aircraft_control_t *aircraft_mode_set)
 {
+    taskENTER_CRITICAL();
+    uint8_t switch_b = aircraft_mode_set->remote_data->B;
+    uint8_t switch_c = aircraft_mode_set->remote_data->C;
+    uint8_t switch_e = aircraft_mode_set->remote_data->E;
+    taskEXIT_CRITICAL();
+
     /*
      * B=0 C=0
      * 安全停机
      */
     if (
-        aircraft_mode_set->remote_data->B == 0 &&
-        aircraft_mode_set->remote_data->C == 0)
+        switch_b == 0 &&
+        switch_c == 0)
     {
         aircraft_mode_set->aircraft_behaviour =
             Aircraft_ZERO_FORCE;
     }
-    /*
-     * B=1 C=0
-     * 光流控速
-     */
-    else if (aircraft_mode_set->remote_data->B == 1 &&
-             aircraft_mode_set->remote_data->C == 0)
-    {
-        aircraft_mode_set->aircraft_behaviour = Aircraft_FLOW_RUN;
-        if (aircraft_mode_set->last_aircraft_behaviour != Aircraft_FLOW_RUN) 
-		{
-            Flow_Run_Enter(aircraft_mode_set);
-        }
-    }
-
     /*
      * B=2 C=0
      * 普通 RUN
@@ -1218,11 +1210,24 @@ void aricraft_behaviour_mode_set(
      * 而是在 RUN 控制内部进入高速 RUN。
      */
     else if (
-        aircraft_mode_set->remote_data->B == 2 &&
-        aircraft_mode_set->remote_data->C == 0)
+        switch_b == 2 &&
+        switch_c == 0)
     {
         aircraft_mode_set->aircraft_behaviour =
             Aircraft_RUN;
+    }
+
+    /*
+     * B=1 C=0
+     * 光流控速进入后保持，停机和普通 RUN 的拨杆组合优先。
+     */
+    else if (aircraft_mode_set->last_aircraft_behaviour == Aircraft_FLOW_RUN ||
+             (switch_b == 1 && switch_c == 0))
+    {
+        aircraft_mode_set->aircraft_behaviour = Aircraft_FLOW_RUN;
+        if (aircraft_mode_set->last_aircraft_behaviour != Aircraft_FLOW_RUN) {
+            Flow_Run_Enter(aircraft_mode_set);
+        }
     }
 
     /*
@@ -1232,9 +1237,9 @@ void aricraft_behaviour_mode_set(
      * 必须放在 Auto 前面。
      */
     else if (
-        aircraft_mode_set->remote_data->E == 2 &&
-        aircraft_mode_set->remote_data->B == 2 &&
-        aircraft_mode_set->remote_data->C == 2)
+        switch_e == 2 &&
+        switch_b == 2 &&
+        switch_c == 2)
     {
         aircraft_mode_set->aircraft_behaviour =
             Aircraft_InRing_R;
@@ -1245,8 +1250,8 @@ void aricraft_behaviour_mode_set(
      * PC Auto
      */
     else if (
-        aircraft_mode_set->remote_data->B == 2 &&
-        aircraft_mode_set->remote_data->C == 2)
+        switch_b == 2 &&
+        switch_c == 2)
     {
         aircraft_mode_set->aircraft_behaviour =
             Aircraft_Auto;
@@ -1257,8 +1262,8 @@ void aricraft_behaviour_mode_set(
      * ADRC RUN
      */
     else if (
-        aircraft_mode_set->remote_data->B == 0 &&
-        aircraft_mode_set->remote_data->C == 2)
+        switch_b == 0 &&
+        switch_c == 2)
     {
         aircraft_mode_set->aircraft_behaviour =
             Aircraft_RUN_ADRC;
@@ -1269,8 +1274,8 @@ void aricraft_behaviour_mode_set(
      * Roll 外环调试
      */
     else if (
-        aircraft_mode_set->remote_data->B == 2 &&
-        aircraft_mode_set->remote_data->C == 1)
+        switch_b == 2 &&
+        switch_c == 1)
     {
         aircraft_mode_set->aircraft_behaviour =
             Aircraft_OutRing_R;
@@ -1539,20 +1544,14 @@ void aricraft_fly_ctrl(
         /* =================== 遥控器死区 ==================== */
         /* ================================================== */
 
-        rc_deadband_limit(
-            aircraft_fly_ctrl
-                ->remote_data
-                ->Right_X,
-            Right_X,
-            stick_deadband);
+        taskENTER_CRITICAL();
+        float right_x = aircraft_fly_ctrl->remote_data->Right_X;
+        float right_y = aircraft_fly_ctrl->remote_data->Right_Y;
+        uint8_t switch_c = aircraft_fly_ctrl->remote_data->C;
+        taskEXIT_CRITICAL();
 
-
-        rc_deadband_limit(
-            aircraft_fly_ctrl
-                ->remote_data
-                ->Right_Y,
-            Right_Y,
-            stick_deadband);
+        rc_deadband_limit(right_x, Right_X, stick_deadband);
+        rc_deadband_limit(right_y, Right_Y, stick_deadband);
 
 
         rc_deadband_limit(
@@ -1632,10 +1631,13 @@ void aricraft_fly_ctrl(
             const OpticalFlow_Data_t *flow = &aircraft_fly_ctrl->flow_data;
             /* 直接使用两轴速度，超时或无解时避免 NaN 进入 PID。 */
             if (isfinite(flow->vx_body_mps) && isfinite(flow->vy_body_mps)) {
-                float desired_vx = Right_Y * (FLOW_RUN_XY_MAX_MPS / 100.0f);  /* 俯仰杆给定机体 X 轴速度，向前为正，单位 m/s */
-                float desired_vy = Right_X * (FLOW_RUN_XY_MAX_MPS / 100.0f);  /* 横滚杆给定机体 Y 轴速度，向右为正，单位 m/s */
-                /* 右杆任一轴超出死区，飞手接管两个水平轴；两轴都回中才采用上位机指令。 */
-                if (Right_X == 0 && Right_Y == 0) {
+                float desired_vx = 0.0f;
+                float desired_vy = 0.0f;
+                /* C=1 时右杆才允许接管。采用上位机指令时，超时保持零速度给定。 */
+                if (switch_c == 1U && (Right_X != 0 || Right_Y != 0)) {
+                    desired_vx = Right_Y * (FLOW_RUN_XY_MAX_MPS / 100.0f);
+                    desired_vy = Right_X * (FLOW_RUN_XY_MAX_MPS / 100.0f);
+                } else {
                     Flow_Apply_PC_Velocity(aircraft_fly_ctrl->pc_data, &desired_vx, &desired_vy);
                 }
                 /* 姿态解算中前倾为正、左滚为正；向右加速需要负的横滚目标角。 */

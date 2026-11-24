@@ -11,7 +11,7 @@
 #define FLOW_RUN_HEIGHT_KI       3.0f   /* 推力指令/(m*s)，实飞调试初值 */
 #define FLOW_RUN_HEIGHT_I_SLEW   3.5f   /* 高度积分项每秒最大变化量，单位为推力指令 */
 #define FLOW_RUN_HEIGHT_KD      20.0f   /* 推力指令/(m/s) */
-#define FLOW_RUN_TARGET_HEIGHT_M  1.0f   /* 光流定高的固定离地高度，单位 m */
+#define FLOW_RUN_TARGET_HEIGHT_M  1.0f   /* 光流定高的旋转中心离地目标，单位 m */
 #define FLOW_RUN_THRUST_MAX     340.0f   /* 垂直控制的基础推力上限，单位为混控前的推力指令 */
 #define FLOW_RUN_THRUST_SLEW    250.0f   /* 基础推力每秒最大变化量，同时限制上升和下降 */
 #define FLOW_RUN_MANUAL_SCALE     3.40f  /* 测距失效时，每 1 个油门杆量对应的手动推力指令 */
@@ -22,15 +22,15 @@
 #define FLOW_RUN_DT_MAX_MS           50U   /* 垂直控制单步 dt 上限，单位 ms，用于高度 PID 积分和推力限速 */
 
 /* 3. 水平速度环 */
-#define FLOW_PC_VELOCITY_TIMEOUT_MS 300U /* 上位机 ID 84 有效期，超时后水平速度由右杆给定 */
+#define FLOW_PC_VELOCITY_TIMEOUT_MS 1500U /* 上位机 ID 248 速度指令的有效期，超时给定零速度 */
 #define FLOW_RUN_XY_MAX_MPS       3.0f   /* 水平满杆的单轴期望速度，单位 m/s */
 /* 两轴各有独立状态与参数。Ki、Kd 沿用本工程 PID_calc 的每控制步约定。 */
-#define FLOW_RUN_VX_KP    5.6f   /* 前向速度误差 -> 俯仰角，度/(m/s) */
-#define FLOW_RUN_VX_KI    0.0001f
-#define FLOW_RUN_VX_KD    0.0f
-#define FLOW_RUN_VY_KP    5.6f   /* 右向速度误差 -> 横滚角，取反后送姿态环 */
-#define FLOW_RUN_VY_KI    0.0001f
-#define FLOW_RUN_VY_KD    0.0f
+#define FLOW_RUN_VX_KP    4.6f   /* 前向速度误差 -> 俯仰角，度/(m/s) */
+#define FLOW_RUN_VX_KI    0.0f
+#define FLOW_RUN_VX_KD    1.0f
+#define FLOW_RUN_VY_KP    4.6f   /* 右向速度误差 -> 横滚角，取反后送姿态环 */
+#define FLOW_RUN_VY_KI    0.0f
+#define FLOW_RUN_VY_KD    1.0f
 #define FLOW_RUN_XY_IOUT_MAX_DEG 12.0f   /* 仅限制 X/Y 积分项幅值，单位度 */
 
 /* 4. 本模式的水平和偏航摇杆 */
@@ -42,6 +42,7 @@
 #define FLOW_BODY_Y_AXIS 1  /* 用于机体 Y 角轴的原始光流分量索引 */
 #define FLOW_BODY_X_SCALE (1.0f)  /* X 角轴的符号与比例校正，负号表示反向 */
 #define FLOW_BODY_Y_SCALE (1.0f)  /* Y 角轴的符号与比例校正 */
+#define FLOW_SENSOR_OFFSET_Z_M 0.055f /* 旋转中心到测距探头沿机体 +Z（向下）的距离 */
 
 /* 6. 观测有效性门限 */
 #define FLOW_TIMEOUT_MS 100U  /* 观测有效期，超过该时间后清除对应的快照有效位 */
@@ -49,11 +50,11 @@
 #define FLOW_MAX_DISTANCE_M 4.0f  /* 有效斜距上限，单位 m */
 #define FLOW_MIN_INTEGRATION_S 0.005f  /* 有效光流积分时间下限，单位 s */
 #define FLOW_MAX_INTEGRATION_S 0.05f  /* 有效光流积分时间上限，单位 s */
-#define FLOW_MIN_TILT_COS 0.8660254f /* 合成倾角约 30deg，近悬停观测使用范围 */
+#define FLOW_MIN_TILT_COS 0.5f /* 合成倾角上限 60°，cos(60°) = 0.5 */
 #define FLOW_MAX_SPEED_MPS 10.0f  /* 速度估计的单轴绝对值上限，超过即判为无效，单位 m/s */
 #define FLOW_IMU_TIMEOUT_MS 10U  /* 姿态快照允许的最大年龄，单位 ms */
 
-/* 7. 光流速度与高度的一阶低通；控制与遥测统一使用滤波结果。
+/* 7. 光流速度与高度的一阶低通。飞控闭环使用滤波结果。
  * 公式：输出 += alpha * (本次测量 - 上次输出)，alpha = dt / (tau + dt)。
  * tau 单位为秒，设为 0 可关闭对应滤波；首帧及断流恢复首帧直接使用测量值。
  * 调试时先保持 PID 不变，对比 aircraft_control.flow_data 中的：
@@ -63,5 +64,5 @@
  * 更大的 tau 会增加反馈延迟，不能用持续加大滤波来消除控制振荡。
  * 高度滤波与第 2 组升降速度滤波会叠加延迟，后续启用定高时需一起观察。
  * 原始光流角位移、质量及原始斜距仍保留，便于检查传感器本身的数据。 */
-#define FLOW_XY_FILTER_TAU_S     0.02f /* 水平速度滤波时间常数；20 ms 帧间隔时 alpha=0.5 */
-#define FLOW_HEIGHT_FILTER_TAU_S 0.02f /* 高度滤波时间常数；20 ms 更新间隔时 alpha=0.4 */
+#define FLOW_XY_FILTER_TAU_S     0.07f /* 水平速度滤波时间常数；20 ms 帧间隔时 alpha=0.5 */
+#define FLOW_HEIGHT_FILTER_TAU_S 0.05f /* 高度滤波时间常数；20 ms 更新间隔时 alpha=0.4 */

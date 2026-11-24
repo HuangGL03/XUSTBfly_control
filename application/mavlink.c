@@ -29,10 +29,18 @@
 #include "usart.h"
 #include <math.h>
 #include "flow_rx.h"
-#include "mavlink_flow.h"
+#include "INS_task.h"
 #include "ringbuffer.h"//环形缓冲区头文件
 #include "stdio.h"
 #define  MAVLINK_READ_BUFFER_SIZE 128
+#define MAVLINK_YAW_DEBUG_INDEX 1U
+#define MAVLINK_YAW_PERIOD_MS 200U
+#define MAVLINK_HEARTBEAT_PERIOD_MS 1000U
+
+#define PC_VELOCITY_EXTENSION_TYPE 0x8001U
+#define PC_VELOCITY_EXTENSION_VERSION 1U
+#define V2_EXTENSION_HEADER_SIZE 5U
+#define PC_VELOCITY_PAYLOAD_SIZE 10U
 #include "cmsis_os.h"
 #include "string.h"
 #include "Aircraft_ctrl_task.h"
@@ -48,6 +56,7 @@ mavlink_rc_channels_override_t packet;//遥控器数据结构体
 mavlink_set_attitude_target_t packet2;//姿态数据结构体
 ELRS_Data elrs_data;
 PC_Data_t pc_data;
+static MavlinkHeartbeatRx_t heartbeat_rx;
 int mavlink_num_test=0;//pc
 /**
   * @brief          get remote control data point
@@ -71,6 +80,18 @@ const ELRS_Data *get_remote_control_point(void)
 const PC_Data_t *get_pc_data_point(void)
 {
     return &pc_data;
+}
+
+bool mavlink_get_heartbeat_snapshot(MavlinkHeartbeatRx_t *out)
+{
+    if (out == NULL) {
+        return false;
+    }
+
+    taskENTER_CRITICAL();
+    *out = heartbeat_rx;
+    taskEXIT_CRITICAL();
+    return out->rx_count != 0U;
 }
 
 void PC_Data_Clear(void)
@@ -258,6 +279,7 @@ void Mavlink_Rece_Enable(void)
 *******************************************************************************/
 void Mavlink_Init(void)
 {
+    mavlink_set_proto_version(MAVLINK_COMM_0, 2);
 	Mavlink_Rece_Enable();
 	Mavlink_RB_Init();
 }
@@ -292,6 +314,52 @@ void mavlink_send_uart_bytes(mavlink_channel_t chan, const uint8_t *ch, int leng
 {
 	HAL_UART_Transmit(&huart3, (uint8_t *)ch, length, 2000);
 }
+
+static int32_t read_le_i16(const uint8_t *bytes)
+{
+    uint16_t value = (uint16_t)bytes[0] | ((uint16_t)bytes[1] << 8);
+    return value < 0x8000U ? (int32_t)value : (int32_t)value - 0x10000;
+}
+
+static void handle_pc_velocity_extension(const mavlink_message_t *msg)
+{
+    if (msg->magic != MAVLINK_STX || msg->len < V2_EXTENSION_HEADER_SIZE + 1U ||
+        msg->len > V2_EXTENSION_HEADER_SIZE + PC_VELOCITY_PAYLOAD_SIZE ||
+        mavlink_msg_v2_extension_get_message_type(msg) != PC_VELOCITY_EXTENSION_TYPE ||
+        mavlink_msg_v2_extension_get_target_network(msg) != 0U) {
+        return;
+    }
+
+    uint8_t target_system = mavlink_msg_v2_extension_get_target_system(msg);
+    uint8_t target_component = mavlink_msg_v2_extension_get_target_component(msg);
+    if ((target_system != 0U && target_system != mavlink_system.sysid) ||
+        (target_component != 0U && target_component != mavlink_system.compid)) {
+        return;
+    }
+
+    /* MAVLink 2 可裁掉末尾的零。按该版本的固定布局将尾部补零。 */
+    uint8_t payload[PC_VELOCITY_PAYLOAD_SIZE] = {0};
+    memcpy(payload, _MAV_PAYLOAD(msg) + V2_EXTENSION_HEADER_SIZE,
+           msg->len - V2_EXTENSION_HEADER_SIZE);
+    if (payload[0] != PC_VELOCITY_EXTENSION_VERSION || payload[1] > 1U) {
+        return;
+    }
+
+    bool enabled = payload[1] == 1U;
+    float vx_mps = enabled ? read_le_i16(&payload[2]) * 0.001f : 0.0f;
+    float vy_mps = enabled ? read_le_i16(&payload[4]) * 0.001f : 0.0f;
+    uint32_t echo_ms = (uint32_t)payload[6] | ((uint32_t)payload[7] << 8) |
+                       ((uint32_t)payload[8] << 16) | ((uint32_t)payload[9] << 24);
+
+    taskENTER_CRITICAL();
+    pc_data.vx_set_mps = vx_mps;
+    pc_data.vy_set_mps = vy_mps;
+    pc_data.velocity_echo_ms = echo_ms;
+    pc_data.velocity_update_ms = HAL_GetTick();
+    ++pc_data.velocity_rx_count;
+    taskEXIT_CRITICAL();
+}
+
 /*******************************函数声明****************************************
 * 函数名称: void Mavlink_Msg_Handle(void)
 * 输入参数:
@@ -304,36 +372,28 @@ void Mavlink_Msg_Handle(mavlink_message_t msg)
 {
 	switch(msg.msgid)
 	{
-	case MAVLINK_MSG_ID_HEARTBEAT:
-		//printf("this is heartbeat from QGC/r/n");
-		break;
+    case MAVLINK_MSG_ID_HEARTBEAT:
+    {
+        mavlink_heartbeat_t heartbeat = {0};
+        mavlink_msg_heartbeat_decode(&msg, &heartbeat);
+
+        taskENTER_CRITICAL();
+        heartbeat_rx.payload = heartbeat;
+        heartbeat_rx.update_ms = HAL_GetTick();
+        heartbeat_rx.sysid = msg.sysid;
+        heartbeat_rx.compid = msg.compid;
+        ++heartbeat_rx.rx_count;
+        taskEXIT_CRITICAL();
+        break;
+    }
 	case MAVLINK_MSG_ID_SET_ATTITUDE_TARGET:
         mavlink_msg_set_attitude_target_decode(&msg, &packet2);//解析数据
         Quaternion_to_Euler_Transform(&packet2,&pc_data);//处理传入数据
 	    mavlink_num_test++;
 		break;
-    case MAVLINK_MSG_ID_SET_POSITION_TARGET_LOCAL_NED:  /* ID 84：机体系水平速度指令 */
-    {
-        mavlink_set_position_target_local_ned_t cmd;
-        mavlink_msg_set_position_target_local_ned_decode(&msg, &cmd);
-        if ((cmd.target_system != 0 && cmd.target_system != mavlink_system.sysid) ||
-            (cmd.target_component != 0 && cmd.target_component != mavlink_system.compid)) {
-            break;
-        }
-        /* 8 和 9 的速度轴均为前、右、下；vx、vy 必须同时启用。 */
-        if ((cmd.coordinate_frame != MAV_FRAME_BODY_NED && cmd.coordinate_frame != MAV_FRAME_BODY_OFFSET_NED) ||
-            (cmd.type_mask & (POSITION_TARGET_TYPEMASK_VX_IGNORE | POSITION_TARGET_TYPEMASK_VY_IGNORE)) ||
-            !isfinite(cmd.vx) || !isfinite(cmd.vy)) {
-            break;
-        }
-        taskENTER_CRITICAL();
-        pc_data.vx_set_mps = cmd.vx;
-        pc_data.vy_set_mps = cmd.vy;
-        pc_data.velocity_update_ms = HAL_GetTick();
-        ++pc_data.velocity_rx_count;
-        taskEXIT_CRITICAL();
+    case MAVLINK_MSG_ID_V2_EXTENSION:
+        handle_pc_velocity_extension(&msg);
         break;
-    }
 	case MAVLINK_MSG_ID_RC_CHANNELS_OVERRIDE:
 	{
 		mavlink_msg_rc_channels_override_decode(&msg, &packet);
@@ -355,15 +415,20 @@ void Mavlink_Msg_Handle(mavlink_message_t msg)
     elrs_data.channels[15] = packet.chan16_raw;
 	elrs_data.Left_X = float_Map_with_median(elrs_data.channels[3], 1000, 2000, 1500, -100, 100);
     elrs_data.Left_Y = float_Map_with_median(elrs_data.channels[2], 1000, 2000, 1500, 0, 100);
-    elrs_data.Right_X = float_Map_with_median(elrs_data.channels[0], 1000, 2000, 1500, -100, 100);
-    elrs_data.Right_Y = float_Map_with_median(elrs_data.channels[1], 1000, 2000, 1500, -100, 100);
+    float right_x = float_Map_with_median(elrs_data.channels[0], 1000, 2000, 1500, -100, 100);
+    float right_y = float_Map_with_median(elrs_data.channels[1], 1000, 2000, 1500, -100, 100);
     elrs_data.S1 = float_Map_with_median(elrs_data.channels[8], 1000, 2000, 1500, 0, 100);
     elrs_data.S2 = float_Map_with_median(elrs_data.channels[9], 1000, 2000, 1500, 0, 100);
     elrs_data.A = elrs_data.channels[10] > 1500 ? 1 : 0;
+    elrs_data.D = elrs_data.channels[11] > 1500 ? 1 : 0;
+    /* 同一帧的模式开关和右杆一起发布，供模式切换和光流接管使用。 */
+    taskENTER_CRITICAL();
+    elrs_data.Right_X = right_x;
+    elrs_data.Right_Y = right_y;
     elrs_data.B = (elrs_data.channels[5] < 1200) ? 0 : ((elrs_data.channels[5] > 1800) ? 2 : 1);
     elrs_data.C = (elrs_data.channels[6] < 1200) ? 0 : ((elrs_data.channels[6] > 1800) ? 2 : 1);
-    elrs_data.D = elrs_data.channels[11] > 1500 ? 1 : 0;
     elrs_data.E = (elrs_data.channels[4] < 1200) ? 1 : ((elrs_data.channels[4] > 1800) ? 2 : 0);
+    taskEXIT_CRITICAL();
     elrs_data.F = (elrs_data.channels[7] < 1200) ? 1 : ((elrs_data.channels[7] > 1800) ? 2 : 0);
 	}
 	break;
@@ -419,49 +484,45 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 	}
 
 }
-/* 同一组姿态和角速度由 INS 原子发布。解算的正方向为左滚、前倾，
- * 转到 MAVLink 前右下机体系时，四元数向量部和角速度均反转 X、Y。 */
-static void send_attitude_quaternion(void)
+static void send_yaw_debug(void)
 {
-    static const float repr_offset_q[4] = {0};  /* 无额外显示旋转 */
     FlowAttitude_t attitude;
     if (!ins_get_flow_attitude(&attitude) ||
         (uint32_t)(HAL_GetTick() - attitude.update_ms) > 100U) {
         return;
     }
-    mavlink_msg_attitude_quaternion_send(MAVLINK_COMM_0, attitude.update_ms,
-        attitude.quat[0], -attitude.quat[1], -attitude.quat[2], attitude.quat[3],
-        -attitude.gyro_rads[0], -attitude.gyro_rads[1], attitude.gyro_rads[2],
-        repr_offset_q);
+
+    float w = attitude.quat[0];
+    float x = attitude.quat[1];
+    float y = attitude.quat[2];
+    float z = attitude.quat[3];
+    /* 与原 MAVLink 四元数遥测的航向符号一致，单位 rad。 */
+    float yaw_rad = atan2f(2.0f * (w * z + x * y), 1.0f - 2.0f * (y * y + z * z));
+    if (isfinite(yaw_rad)) {
+        mavlink_msg_debug_send(MAVLINK_COMM_0, attitude.update_ms, MAVLINK_YAW_DEBUG_INDEX, yaw_rad);
+    }
 }
 
 void mavlink_task(void const *pvParameters)
 {
-    static const char flow_name[10] = "FLOW_EST";  /* ID 250 固定宽度名称 */
-    uint32_t last_telemetry_ms = HAL_GetTick();
-    uint32_t last_heartbeat_ms = last_telemetry_ms - 500U;  /* 启动立即发心跳 */
+    (void)pvParameters;
+    uint32_t last_yaw_ms = HAL_GetTick();
+    uint32_t last_heartbeat_ms = last_yaw_ms - MAVLINK_HEARTBEAT_PERIOD_MS;  /* 启动立即发心跳 */
     while (1)
     {
         Loop_Mavlink_Parse();
         uint32_t now = HAL_GetTick();
         uint32_t elapsed = now - last_heartbeat_ms;
-        if (elapsed >= 500U) {
-            last_heartbeat_ms += elapsed - elapsed % 500U;
-            /* 固定标识：扑翼飞行器、通用飞控，模式为 0，状态填未知。 */
+        if (elapsed >= MAVLINK_HEARTBEAT_PERIOD_MS) {
+            last_heartbeat_ms += elapsed - elapsed % MAVLINK_HEARTBEAT_PERIOD_MS;
             mavlink_msg_heartbeat_send(MAVLINK_COMM_0, MAV_TYPE_FLAPPING_WING,
                 MAV_AUTOPILOT_GENERIC, 0, 0, MAV_STATE_UNINIT);
         }
 
-        elapsed = now - last_telemetry_ms;
-        if (elapsed >= 50U) {
-            last_telemetry_ms += elapsed - elapsed %50U;
-            send_attitude_quaternion();
-            OpticalFlow_Data_t flow;
-            uint32_t snapshot_ms = HAL_GetTick();
-            mavlink_flow_get_snapshot(&flow, snapshot_ms);
-            /* ID 250：滤波后的前向、右向速度 (m/s) 和离地高度 (m)。 */
-            mavlink_msg_debug_vect_send(MAVLINK_COMM_0, flow_name, (uint64_t)snapshot_ms * 1000U,
-                flow.vx_body_mps, flow.vy_body_mps, flow.height_m);
+        elapsed = now - last_yaw_ms;
+        if (elapsed >= MAVLINK_YAW_PERIOD_MS) {
+            last_yaw_ms += elapsed - elapsed % MAVLINK_YAW_PERIOD_MS;
+            send_yaw_debug();
         }
         vTaskDelay(pdMS_TO_TICKS(10));
     }

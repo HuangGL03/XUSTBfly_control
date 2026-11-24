@@ -58,8 +58,8 @@ typedef struct
     float vy_raw_mps;          /* 完成旋转和倾斜补偿、滤波前的水平右向速度，单位 m/s */
     float vx_body_mps;         /* 低通后的水平前向速度，沿当前航向，供速度环和遥测使用，单位 m/s */
     float vy_body_mps;         /* 低通后的水平右向速度，单位 m/s */
-    float height_raw_m;        /* 倾角补偿后、低通滤波前的离地高度，用于调试对比，单位 m */
-    float height_m;            /* 低通滤波后的离地高度，向上为正，供控制和遥测使用，单位 m */
+    float height_raw_m;        /* 滤波前的旋转中心离地高度，单位 m */
+    float height_m;            /* 滤波后的旋转中心离地高度，向上为正，供控制和遥测使用，单位 m */
     uint32_t height_update_ms;  /* 最近一次用斜距更新高度估计的时间戳，单位 ms */
     uint8_t velocity_valid;  /* 表示本帧已算出两轴速度且未超时，不代表模块质量合格 */
     uint8_t height_valid;  /* 为 1 时可使用本快照内的离地高度，与速度有效位独立 */

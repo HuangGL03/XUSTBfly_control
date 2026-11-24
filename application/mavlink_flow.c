@@ -126,7 +126,7 @@ static void update_height(OpticalFlow_Data_t *next, float distance,
     next->height_m = height_filter.height_m;
 }
 
-/* 只用 106 帧自身倾斜校正后的高度估计升降速度，避免 132 帧交错导致差分跳变。
+/* 只用 106 帧自身的旋转中心高度估计升降速度，避免与 132 帧交错差分。
  * 假设观测地面局部平坦；首次有效帧及断流恢复时以零升降速度起步。 */
 static float flow_climb_rate(const OpticalFlow_Data_t *sample, uint32_t now)
 {
