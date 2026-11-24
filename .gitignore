@@ -1,0 +1,13 @@
+# Keil build output
+/MDK-ARM/fly_control_stm/
+/MDK-ARM/fly_control_stm.BAT
+/MDK-ARM/startup_stm32h743xx.lst
+
+# Local IDE and debugger state
+/MDK-ARM/*.uvguix.*
+/MDK-ARM/*.uvoptx
+/MDK-ARM/JLinkLog.txt
+/MDK-ARM/JLinkSettings.ini
+
+# Stray copy of an include directive
+/1
