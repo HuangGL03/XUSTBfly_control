@@ -21,10 +21,13 @@ extern "C" {
 typedef struct
 {
     uint32_t update_ms;
+    uint32_t velocity_sample_ms;             /* 本控制周期使用的光流观测时间 */
     uint8_t flow_mode_active;
     uint8_t xy_pid_active;
     uint8_t height_pid_active;
+    uint8_t velocity_valid;
     float vx_set_mps, vy_set_mps;             /* 速度环实际使用的期望速度 */
+    float vx_feedback_mps, vy_feedback_mps;   /* 速度环启用时为实际反馈，停用时为滤波观测 */
     float vx_unclamped_deg, vy_unclamped_deg; /* Pout + Iout + Dout，输出限幅前 */
     float vx_pid_out_deg, vy_pid_out_deg;     /* 送往姿态环的速度 PID 输出，Y 轴尚未取反 */
     float pitch_target_deg, roll_target_deg;  /* 姿态环实际接收的目标角 */

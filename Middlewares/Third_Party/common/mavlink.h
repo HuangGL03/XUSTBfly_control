@@ -85,11 +85,11 @@ typedef struct
     float pitch;
     float yaw;
     float thrust;
-    float vx_set_mps;            /* 上位机 ID 84 期望前向速度，单位 m/s，向前为正 */
-    float vy_set_mps;            /* 上位机 ID 84 期望右向速度，单位 m/s，向右为正 */
-    uint32_t velocity_echo_ms;  /* 上位机回显的飞控 yaw 采样时间，单位 ms */
-    uint32_t velocity_update_ms; /* 最近一次接收有效水平速度指令的本机时间，单位 ms */
-    uint32_t velocity_rx_count;  /* 自清零以来接收的有效水平速度指令数 */
+    float vx_set_mps, vy_set_mps;                /* 速度指令，前向/右向为正 */
+    float flow_pitch_set_deg, flow_roll_set_deg; /* 姿态指令，前倾/左滚为正 */
+    uint32_t flow_target_echo_ms;                /* 上位机回显的飞控 yaw 采样时间 */
+    uint32_t flow_target_update_ms;              /* 指令接收时间，单位 ms */
+    uint32_t flow_target_rx_count;               /* 自清零以来的有效指令数 */
 
 } PC_Data_t;//来自PC的数据
 const ELRS_Data *get_remote_control_point(void);

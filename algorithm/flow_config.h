@@ -1,5 +1,9 @@
 #pragma once
 
+/* QGC 速度环调试：1 发送期望与实测速度，0 恢复上位机 yaw 遥测。 */
+#define MAVLINK_QGC_FLOW_DEBUG_ENABLE 1
+#define MAVLINK_QGC_FLOW_DEBUG_PERIOD_MS 100U
+
 /* B=1、C=0 光流控速模式调参。高度向上为正，水平速度沿机体前、右为正。
  * 定高先看第 1、2 组；第 5、6 组用于核对安装方向和观测有效性。 */
 
@@ -21,14 +25,18 @@
 #define FLOW_RUN_VZ_FILTER_TAU_S     0.08f /* 升降速度一阶低通时间常数，单位 s；增大后更平滑、滞后更大 */
 #define FLOW_RUN_DT_MAX_MS           50U   /* 垂直控制单步 dt 上限，单位 ms，用于高度 PID 积分和推力限速 */
 
-/* 3. 水平速度环 */
-#define FLOW_PC_VELOCITY_TIMEOUT_MS 1500U /* 上位机 ID 248 速度指令的有效期，超时给定零速度 */
+/* 3. 光流水平控制 */
+#define FLOW_RUN_XY_VELOCITY_ENABLE 0     /* 0：直接使用目标姿态；1：使用水平速度环 */
+#define FLOW_PC_TARGET_TIMEOUT_MS 1500U   /* 上位机 ID 248 指令有效期，超时给定零 */
+#define FLOW_RUN_ATTITUDE_MAX_DEG 30.0f    /* 直接姿态控制时的单轴目标角限幅 */
 #define FLOW_RUN_XY_MAX_MPS       3.0f   /* 水平满杆的单轴期望速度，单位 m/s */
+#define FLOW_RUN_VX_FEEDBACK_SCALE 3.5f   /* 前向滤波速度进入速度 PID 前的倍率 */
+#define FLOW_RUN_VY_FEEDBACK_SCALE 4.0f   /* 右向滤波速度进入速度 PID 前的倍率 */
 /* 两轴各有独立状态与参数。Ki、Kd 沿用本工程 PID_calc 的每控制步约定。 */
 #define FLOW_RUN_VX_KP    4.6f   /* 前向速度误差 -> 俯仰角，度/(m/s) */
 #define FLOW_RUN_VX_KI    0.0f
 #define FLOW_RUN_VX_KD    1.0f
-#define FLOW_RUN_VY_KP    4.6f   /* 右向速度误差 -> 横滚角，取反后送姿态环 */
+#define FLOW_RUN_VY_KP    5.6f   /* 右向速度误差 -> 横滚角，取反后送姿态环 */
 #define FLOW_RUN_VY_KI    0.0f
 #define FLOW_RUN_VY_KD    1.0f
 #define FLOW_RUN_XY_IOUT_MAX_DEG 12.0f   /* 仅限制 X/Y 积分项幅值，单位度 */

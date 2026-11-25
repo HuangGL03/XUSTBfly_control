@@ -469,14 +469,22 @@ static void Flow_Record_Control(aircraft_control_t *aircraft)
     OpticalFlow_Control_t *control = &aircraft->flow_data.control;
     *control = (OpticalFlow_Control_t){
         .update_ms = HAL_GetTick(),
+        .velocity_sample_ms = aircraft->flow_data.flow_update_ms,
         .flow_mode_active = aircraft->aircraft_behaviour == Aircraft_FLOW_RUN,
+        .velocity_valid = aircraft->flow_data.velocity_valid,
+        .vx_feedback_mps = aircraft->flow_data.vx_body_mps,
+        .vy_feedback_mps = aircraft->flow_data.vy_body_mps,
         .motor_left_ccr = __HAL_TIM_GET_COMPARE(&htim3, TIM_CHANNEL_4),
         .motor_right_ccr = __HAL_TIM_GET_COMPARE(&htim3, TIM_CHANNEL_3),
         .servo_left_ccr = __HAL_TIM_GET_COMPARE(&htim5, TIM_CHANNEL_2),
         .servo_right_ccr = __HAL_TIM_GET_COMPARE(&htim5, TIM_CHANNEL_1),
     };
     if (control->flow_mode_active) {
-        control->xy_pid_active = aircraft->flow_data.velocity_valid;
+        control->xy_pid_active = FLOW_RUN_XY_VELOCITY_ENABLE && aircraft->flow_data.velocity_valid;
+        if (control->xy_pid_active) {
+            control->vx_feedback_mps = PID_flow_vx.fdb;
+            control->vy_feedback_mps = PID_flow_vy.fdb;
+        }
         control->height_pid_active = FLOW_RUN_HEIGHT_ENABLE && aircraft->flow_data.height_valid;
         control->vx_set_mps = PID_flow_vx.set;
         control->vy_set_mps = PID_flow_vy.set;
@@ -1077,18 +1085,19 @@ static void Flip_Controller_Reset(
         ->IMU_data
         ->INS_angle[0];
 }
-/* 读取有效的 ID 248 水平速度给定，两轴共用速度上限。 */
-static void Flow_Apply_PC_Velocity(const PC_Data_t *pc, float *vx, float *vy)
+/* 读取当前水平控制方式对应的 ID 248 目标，超时保持调用方的零目标。 */
+static void Flow_Apply_PC_Target(const PC_Data_t *pc, float *x, float *y)
 {
+    const float limit = FLOW_RUN_XY_VELOCITY_ENABLE ? FLOW_RUN_XY_MAX_MPS : FLOW_RUN_ATTITUDE_MAX_DEG;
     taskENTER_CRITICAL();
-    bool fresh = pc->velocity_rx_count != 0U &&
-        (uint32_t)(HAL_GetTick() - pc->velocity_update_ms) <= FLOW_PC_VELOCITY_TIMEOUT_MS;
-    float pc_vx = pc->vx_set_mps;
-    float pc_vy = pc->vy_set_mps;
+    bool fresh = pc->flow_target_rx_count != 0U &&
+        (uint32_t)(HAL_GetTick() - pc->flow_target_update_ms) <= FLOW_PC_TARGET_TIMEOUT_MS;
+    float target_x = FLOW_RUN_XY_VELOCITY_ENABLE ? pc->vx_set_mps : pc->flow_pitch_set_deg;
+    float target_y = FLOW_RUN_XY_VELOCITY_ENABLE ? pc->vy_set_mps : pc->flow_roll_set_deg;
     taskEXIT_CRITICAL();
     if (fresh) {
-        *vx = (float)num_limit(pc_vx, -FLOW_RUN_XY_MAX_MPS, FLOW_RUN_XY_MAX_MPS);
-        *vy = (float)num_limit(pc_vy, -FLOW_RUN_XY_MAX_MPS, FLOW_RUN_XY_MAX_MPS);
+        *x = (float)num_limit(target_x, -limit, limit);
+        *y = (float)num_limit(target_y, -limit, limit);
     }
 }
 
@@ -1629,25 +1638,33 @@ void aricraft_fly_ctrl(
         else if (aircraft_fly_ctrl->aircraft_behaviour == Aircraft_FLOW_RUN)
         {
             const OpticalFlow_Data_t *flow = &aircraft_fly_ctrl->flow_data;
-            /* 直接使用两轴速度，超时或无解时避免 NaN 进入 PID。 */
-            if (isfinite(flow->vx_body_mps) && isfinite(flow->vy_body_mps)) {
+            bool stick_override = switch_c == 1U && (Right_X != 0 || Right_Y != 0);
+            if (!FLOW_RUN_XY_VELOCITY_ENABLE) {
+                if (stick_override) {
+                    target_pitch = Right_Y * RUN_PITCH_SCALE;
+                    target_roll = -Right_X * RUN_ROLL_SCALE;
+                } else {
+                    Flow_Apply_PC_Target(aircraft_fly_ctrl->pc_data, &target_pitch, &target_roll);
+                }
+            } else if (isfinite(flow->vx_body_mps) && isfinite(flow->vy_body_mps)) {
                 float desired_vx = 0.0f;
                 float desired_vy = 0.0f;
-                /* C=1 时右杆才允许接管。采用上位机指令时，超时保持零速度给定。 */
-                if (switch_c == 1U && (Right_X != 0 || Right_Y != 0)) {
+                if (stick_override) {
                     desired_vx = Right_Y * (FLOW_RUN_XY_MAX_MPS / 100.0f);
                     desired_vy = Right_X * (FLOW_RUN_XY_MAX_MPS / 100.0f);
                 } else {
-                    Flow_Apply_PC_Velocity(aircraft_fly_ctrl->pc_data, &desired_vx, &desired_vy);
+                    Flow_Apply_PC_Target(aircraft_fly_ctrl->pc_data, &desired_vx, &desired_vy);
                 }
                 /* 姿态解算中前倾为正、左滚为正；向右加速需要负的横滚目标角。 */
-                target_pitch = PID_calc(&PID_flow_vx, flow->vx_body_mps, desired_vx);
-                target_roll = -PID_calc(&PID_flow_vy, flow->vy_body_mps, desired_vy);
+                float vx_feedback = flow->vx_body_mps * FLOW_RUN_VX_FEEDBACK_SCALE;
+                float vy_feedback = flow->vy_body_mps * FLOW_RUN_VY_FEEDBACK_SCALE;
+                target_pitch = PID_calc(&PID_flow_vx, vx_feedback, desired_vx);
+                target_roll = -PID_calc(&PID_flow_vy, vy_feedback, desired_vy);
             } else {
                 PID_clear(&PID_flow_vx);
                 PID_clear(&PID_flow_vy);
             }
-            /* 水平速度失效时，俯仰和横滚目标保持本周期初值 0 度；偏航仍由左横杆控制。 */
+            /* 偏航由左横杆控制，推力由原定高逻辑计算。 */
             aircraft_fly_ctrl->yaw_set_angle -= Left_X * FLOW_RUN_YAW_SCALE;
             base_thrust = Flow_Run_Thrust(flow, aircraft_fly_ctrl->remote_data->Left_Y);
         }

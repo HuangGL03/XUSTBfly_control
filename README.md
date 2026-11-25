@@ -66,7 +66,7 @@ TIM3 和 TIM5 的 PWM 周期均为 20 ms。正常控制时，代码将电机指�
 | 遥控组合 | 模式 | 控制行为 |
 | --- | --- | --- |
 | B=0，C=0 | 停机 `Aircraft_ZERO_FORCE` | 电机输出最小脉宽，舵机回中 |
-| B=1，C=0 | 光流控速 `Aircraft_FLOW_RUN` | 上位机给定水平速度，进入后可拨到 C=1 允许右杆接管。左横杆调整航向，测距有效且定高开启时跟踪固定离地高度 |
+| B=1，C=0 | 光流模式 `Aircraft_FLOW_RUN` | 默认由上位机直接给定俯仰与横滚，进入后可拨到 C=1 允许右杆接管。左横杆调整航向，测距有效且定高开启时跟踪固定离地高度 |
 | B=2，C=0 | 手动飞行 `Aircraft_RUN` | 右杆给定姿态，油门杆给定基础推力。E=2 时使用高速操纵参数 |
 | B=0，C=2 | `Aircraft_RUN_ADRC` | 保留姿态外环，使用 ADRC 计算三个轴的角速度控制输出 |
 | B=2，C=2，E≠2 | 上位机辅助 `Aircraft_Auto` | 上位机提供滚转、俯仰目标及附加推力。遥控器保留基础油门和航向调整 |
@@ -80,13 +80,13 @@ TIM3 和 TIM5 的 PWM 周期均为 20 ms。正常控制时，代码将电机指�
 
 INS 对 BMI088 原始读数扣除零偏并转换物理单位，逐轴通过二阶低通，再用 Madgwick 算法更新姿态。当前使用代码内的板级零偏参数。飞控使用欧拉角和角速度反馈，光流与航向遥测通过临界区复制带有效标志和时间戳的 `FlowAttitude_t` 快照。控制内部欧拉角以度为单位，航向遥测以 rad 为单位。 [INS 实现](application/INS_task.c) · [坐标示意图](Diagram%20of%20the%20coordinate%20system.jpg)
 
-### 光流控速与定高
+### 光流水平控制与定高
 
 1. 光流估计将 `OPTICAL_FLOW_RAD` 的积分角位移按时间换算为角速度，用机载 IMU 消除镜头旋转造成的视野运动。换算成探头的平移速度后，再扣除探头绕旋转中心运动的速度，结合倾角和旋转中心升降速度，求得沿当前航向的前向、右向速度。
 2. 高度估计可由 `OPTICAL_FLOW_RAD.distance` 或 `DISTANCE_SENSOR.current_distance` 更新。探头在旋转中心正下方 5.5 cm，定高使用旋转中心高度，按 `(斜距 + 0.055 m) × cos(roll) × cos(pitch)` 计算。光流速度解算使用 106 帧旋转中心高度的差分补偿升降分量。速度和高度分别低通，并使用独立的有效标志。
-3. 水平速度 PID 将前向误差转换为俯仰目标，将右向误差转换为横滚目标。C=1 时，右杆任一轴超出死区便接管两个水平轴，右杆回中后交回上位机。C=0 或 C=2 时，水平速度由上位机给定。由上位机控制时，若从未收到有效指令，或距上一条有效指令已超过 1500 ms，则给定零速度。光流速度观测失效时清除速度 PID，俯仰和横滚目标回到 0°。
+3. `FLOW_RUN_XY_VELOCITY_ENABLE=0` 时，上位机直接给定俯仰和横滚，两轴分别限幅到 ±30° 后送入姿态环。C=1 时，右杆超出死区即可接管，沿用普通 RUN 的摇杆到角度映射，回中后交回上位机。上位机指令缺失、停用或超过 1500 ms 时，目标角为 0°。若重新启用水平速度环，低通后的 X、Y 速度分别按 3.5、4.0 缩放后送入速度 PID，再由速度 PID 产生目标角。
 4. 高度环用高度误差和垂直速度计算推力。P 项修正高度偏差，D 项抑制实际升降，I 项缓慢修正维持高度所需的基础推力。测距首次有效或恢复时，以当前推力初始化积分并重建速度差分。积分增量设有速率上限，推力限幅或限速时只允许积分朝减轻受限的方向变化。
-5. 测距失效时，基础推力按限速过渡到手动油门映射。将 `FLOW_RUN_HEIGHT_ENABLE` 设为 0 可用手动油门保留水平速度控制。
+5. 测距失效时，基础推力按限速过渡到手动油门映射。将 `FLOW_RUN_HEIGHT_ENABLE` 设为 0 可用手动油门保留当前水平控制方式。
 
 观测有效性受斜距、倾角、积分时间和 IMU 数据时效等条件约束。速度和高度过期或无效时，快照将相应字段置为 `NaN`。光流质量值会保留供调试，当前速度有效性判定依据几何、时间及数值范围。 [观测快照](application/mavlink_flow.c) · [速度与高度解算](algorithm/optical_flow.c) · [闭环实现](application/Aircraft_ctrl_task.c)
 
@@ -101,37 +101,52 @@ INS 对 BMI088 原始读数扣除零偏并转换物理单位，逐轴通过二�
 | USART3 | `HEARTBEAT` | 0 | 保存最近一帧的来源系统 ID、组件 ID、心跳载荷、本机接收时间及累计接收数 |
 | USART3 | `RC_CHANNELS_OVERRIDE` | 70 | 解析遥控通道、摇杆和开关 |
 | USART3 | `SET_ATTITUDE_TARGET` | 82 | 将四元数解算为工程姿态角并保存推力，供 Auto 使用 |
-| USART3 | `V2_EXTENSION` | 248 | 光流模式水平速度指令。按下文约定解码前向速度、右向速度、使能和采样时间回显 |
+| USART3 | `V2_EXTENSION` | 248 | 光流模式水平控制指令。当前解码俯仰角、横滚角、使能和采样时间回显 |
 | USART2 | `OPTICAL_FLOW_RAD` | 106 | 光流积分量、积分时间、质量及该帧斜距 |
 | USART2 | `DISTANCE_SENSOR` | 132 | 读取 `current_distance`，将厘米换算为米后更新高度 |
 
+### QGC 速度环调试
+
+当前编译配置 `MAVLINK_QGC_FLOW_DEBUG_ENABLE=1`。飞控通过 USART3 发送两路 `DEBUG_VECT`（ID 250），各 10 Hz，心跳为 1 Hz。期望与实测速度取自同一个飞控周期，单位 m/s。
+
+| 组件 ID | 名称 | `x`（前向） | `y`（右向） | `z` |
+| --- | --- | --- | --- | --- |
+| 25 | `FLOW_SP` | 期望速度 | 期望速度 | 1 表示水平速度环正在使用该给定 |
+| 26 | `FLOW_EST` | 速度反馈 | 速度反馈 | 1 表示速度观测有效 |
+
+速度环启用时，`FLOW_EST` 显示 PID 实际使用的反馈值。当前直接姿态控制下，`FLOW_SP` 的速度给定为 `NaN`，`FLOW_EST` 显示滤波后的速度观测。实际送入姿态环的目标角可在 Keil 查看 `aircraft_control.flow_data.control.pitch_target_deg` 和 `roll_target_deg`。
+
+`z=0` 时，该路的 `x`、`y` 为 `NaN`。从 QGC 的 **Analyze Tools → MAVLink Inspector** 打开系统 1，显示全部组件。把组件 25 和 26 的 `x` 加到同一张图，两个 `y` 加到另一张图。用遥控器调试时，先拨 `B=1、C=0` 进入光流模式，再拨 `C=1` 允许右杆接管。调试完成后将 `MAVLINK_QGC_FLOW_DEBUG_ENABLE` 改为 `0` 并重新编译烧录，即可恢复 yaw 遥测。 [调试开关](algorithm/flow_config.h) · [QGC MAVLink Inspector](https://docs.qgroundcontrol.com/Stable_V5.0/en/qgc-user-guide/analyze_view/mavlink_inspector.html)
+
 ### 飞控与电脑的 MAVLink 2 消息
+
+以下为 `MAVLINK_QGC_FLOW_DEBUG_ENABLE=0` 时的通信组合。
 
 | 方向 | 消息 | 频率 | 无签名帧大小 | 内容 |
 | --- | --- | ---: | ---: | --- |
 | 飞控 → 电脑 | `DEBUG`（254） | 5 Hz | 21 字节 | `ind=1` 表示 yaw，`value` 为前右下坐标约定的航向角，单位 rad，范围约为 −π 到 π。 `time_boot_ms` 为该姿态快照在飞控上的采样时间 |
-| 电脑 → 飞控 | `V2_EXTENSION`（248） | 10 Hz | 最多 27 字节 | 水平速度指令与时间回显 |
+| 电脑 → 飞控 | `V2_EXTENSION`（248） | 10 Hz | 最多 27 字节 | 期望姿态指令与时间回显 |
 | 双向 | `HEARTBEAT`（0） | 各 1 Hz | 各 21 字节 | 系统识别。飞控在启动时立即发一帧 |
 
 上述三类消息的原始流量上限为 `5 × 21 + 10 × 27 + 2 × 21 = 417` 字节/秒。ELRS 封装、重传及其他 MAVLink 消息另计，实际转发需联调验证。姿态快照无效或超过 100 ms 时跳过本次 yaw 遥测。飞控的发送周期由 `MAVLINK_YAW_PERIOD_MS` 和 `MAVLINK_HEARTBEAT_PERIOD_MS` 配置。 [发送实现](application/mavlink.c) · [MAVLink 2 序列化](https://mavlink.io/en/guide/serialization.html)
 
-### 水平速度指令载荷
+### 光流水平控制指令载荷
 
-电脑发送 `V2_EXTENSION` 时，将 `message_type` 设为本工程约定的 **`0x8001`**，`target_network=0`，`target_system=1`，`target_component=1`。飞控也接受目标系统或组件为 0 的广播。以下偏移相对于该消息的 `payload` 数组，所有多字节数值使用小端编码。
+电脑发送 `V2_EXTENSION` 时，将 `message_type` 设为本工程约定的 **`0x8002`**，`target_network=0`，`target_system=1`，`target_component=1`。飞控也接受目标系统或组件为 0 的广播。以下偏移相对于该消息的 `payload` 数组，所有多字节数值使用小端编码。
 
 | 字节偏移 | 类型 | 含义 |
 | --- | --- | --- |
 | 0 | `uint8` | 载荷版本，固定为 1 |
-| 1 | `uint8` | 使能，0 表示停止，1 表示采用速度指令 |
-| 2–3 | `int16` | 期望 `vx`，前向为正，单位 mm/s |
-| 4–5 | `int16` | 期望 `vy`，右向为正，单位 mm/s |
+| 1 | `uint8` | 使能，0 将目标角置零，1 采用姿态指令 |
+| 2–3 | `int16` | 期望俯仰，前倾为正，单位 0.01° |
+| 4–5 | `int16` | 期望横滚，左滚为正，单位 0.01° |
 | 6–9 | `uint32` | 回显最近一次 `DEBUG.ind=1` 的 `time_boot_ms`。收到第一帧 yaw 前可填 0 |
 
-电脑端可用 Python 的 `struct.pack("<BBhhI", 1, enabled, vx_mm_s, vy_mm_s, echo_ms)` 序列化，再将数组尾部补零至 249 字节交给 MAVLink 2 库。MAVLink 2 打包会裁剪尾部零，飞控按固定布局补回。停止时发送 `enabled=0, vx=0, vy=0`，飞控将上位机的两轴速度目标置零。飞控接收后按本机接收时间判断 1500 ms 超时，回显值记录在 `pc_data.velocity_echo_ms` 供联调。心跳接收可通过 `mavlink_get_heartbeat_snapshot()` 读取。 [指令与心跳解析](application/mavlink.c) · [V2_EXTENSION 消息](https://mavlink.io/en/messages/common.html#V2_EXTENSION)
+电脑端可用 Python 的 `struct.pack("<BBhhI", 1, enabled, pitch_cdeg, roll_cdeg, echo_ms)` 序列化，再将数组尾部补零至 249 字节交给 MAVLink 2 库。MAVLink 2 打包会裁剪尾部零，飞控按固定布局补回。停用时发送 `enabled=0, pitch_cdeg=0, roll_cdeg=0`。飞控按本机接收时间判断 1500 ms 超时，回显值记录在 `pc_data.flow_target_echo_ms`。将 `FLOW_RUN_XY_VELOCITY_ENABLE` 改为 1 并重新构建后，飞控接收 `0x8001`，两个 `int16` 恢复为前向和右向速度，单位 mm/s。心跳接收可通过 `mavlink_get_heartbeat_snapshot()` 读取。 [指令与心跳解析](application/mavlink.c) · [V2_EXTENSION 消息](https://mavlink.io/en/messages/common.html#V2_EXTENSION)
 
 ## 主要调试参数
 
-光流解算、水平速度控制和定高参数集中在 [flow_config.h](algorithm/flow_config.h)。以下是仓库当前默认值，推力指令沿用工程内部量纲。
+光流解算、水平控制和定高参数集中在 [flow_config.h](algorithm/flow_config.h)。以下是仓库当前默认值，推力指令沿用工程内部量纲。
 
 | 参数 | 当前值 | 用途 |
 | --- | ---: | --- |
@@ -141,7 +156,9 @@ INS 对 BMI088 原始读数扣除零偏并转换物理单位，逐轴通过二�
 | `FLOW_RUN_HEIGHT_I_SLEW` | 3.5 /s | 高度积分项最大变化速率 |
 | `FLOW_RUN_THRUST_MAX` | 340 | 混控前的基础推力上限 |
 | `FLOW_RUN_THRUST_SLEW` | 250 /s | 混控前基础推力的变化率限制 |
-| `FLOW_RUN_XY_MAX_MPS` | 3.0 m/s | 水平速度给定的单轴限值 |
+| `FLOW_RUN_XY_VELOCITY_ENABLE` | 0 | 光流模式使用直接姿态指令 |
+| `FLOW_RUN_ATTITUDE_MAX_DEG` | 30.0° | 上位机目标角的单轴限幅 |
+| `FLOW_RUN_XY_MAX_MPS` | 3.0 m/s | 启用速度环时的单轴速度给定限值 |
 | `FLOW_XY_FILTER_TAU_S` / `FLOW_HEIGHT_FILTER_TAU_S` | 0.02 s / 0.02 s | 水平速度及离地高度的低通时间常数 |
 | `FLOW_RUN_VZ_FILTER_TAU_S` | 0.08 s | 高度差分得出的升降速度低通时间常数 |
 | `FLOW_MIN_DISTANCE_M` / `FLOW_MAX_DISTANCE_M` | 0.08–4.0 m | 光流估计接受的斜距范围 |

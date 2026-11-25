@@ -30,6 +30,8 @@
 #include <math.h>
 #include "flow_rx.h"
 #include "INS_task.h"
+#include "mavlink_flow.h"
+#include "flow_config.h"
 #include "ringbuffer.h"//环形缓冲区头文件
 #include "stdio.h"
 #define  MAVLINK_READ_BUFFER_SIZE 128
@@ -37,10 +39,11 @@
 #define MAVLINK_YAW_PERIOD_MS 200U
 #define MAVLINK_HEARTBEAT_PERIOD_MS 1000U
 
-#define PC_VELOCITY_EXTENSION_TYPE 0x8001U
-#define PC_VELOCITY_EXTENSION_VERSION 1U
+#define PC_FLOW_VELOCITY_EXTENSION_TYPE 0x8001U
+#define PC_FLOW_ATTITUDE_EXTENSION_TYPE 0x8002U
+#define PC_FLOW_EXTENSION_VERSION 1U
 #define V2_EXTENSION_HEADER_SIZE 5U
-#define PC_VELOCITY_PAYLOAD_SIZE 10U
+#define PC_FLOW_PAYLOAD_SIZE 10U
 #include "cmsis_os.h"
 #include "string.h"
 #include "Aircraft_ctrl_task.h"
@@ -321,11 +324,13 @@ static int32_t read_le_i16(const uint8_t *bytes)
     return value < 0x8000U ? (int32_t)value : (int32_t)value - 0x10000;
 }
 
-static void handle_pc_velocity_extension(const mavlink_message_t *msg)
+static void handle_pc_flow_extension(const mavlink_message_t *msg)
 {
+    const uint16_t command_type = FLOW_RUN_XY_VELOCITY_ENABLE
+        ? PC_FLOW_VELOCITY_EXTENSION_TYPE : PC_FLOW_ATTITUDE_EXTENSION_TYPE;
     if (msg->magic != MAVLINK_STX || msg->len < V2_EXTENSION_HEADER_SIZE + 1U ||
-        msg->len > V2_EXTENSION_HEADER_SIZE + PC_VELOCITY_PAYLOAD_SIZE ||
-        mavlink_msg_v2_extension_get_message_type(msg) != PC_VELOCITY_EXTENSION_TYPE ||
+        msg->len > V2_EXTENSION_HEADER_SIZE + PC_FLOW_PAYLOAD_SIZE ||
+        mavlink_msg_v2_extension_get_message_type(msg) != command_type ||
         mavlink_msg_v2_extension_get_target_network(msg) != 0U) {
         return;
     }
@@ -338,25 +343,30 @@ static void handle_pc_velocity_extension(const mavlink_message_t *msg)
     }
 
     /* MAVLink 2 可裁掉末尾的零。按该版本的固定布局将尾部补零。 */
-    uint8_t payload[PC_VELOCITY_PAYLOAD_SIZE] = {0};
+    uint8_t payload[PC_FLOW_PAYLOAD_SIZE] = {0};
     memcpy(payload, _MAV_PAYLOAD(msg) + V2_EXTENSION_HEADER_SIZE,
            msg->len - V2_EXTENSION_HEADER_SIZE);
-    if (payload[0] != PC_VELOCITY_EXTENSION_VERSION || payload[1] > 1U) {
+    if (payload[0] != PC_FLOW_EXTENSION_VERSION || payload[1] > 1U) {
         return;
     }
 
     bool enabled = payload[1] == 1U;
-    float vx_mps = enabled ? read_le_i16(&payload[2]) * 0.001f : 0.0f;
-    float vy_mps = enabled ? read_le_i16(&payload[4]) * 0.001f : 0.0f;
+    int32_t target_x = enabled ? read_le_i16(&payload[2]) : 0;
+    int32_t target_y = enabled ? read_le_i16(&payload[4]) : 0;
     uint32_t echo_ms = (uint32_t)payload[6] | ((uint32_t)payload[7] << 8) |
                        ((uint32_t)payload[8] << 16) | ((uint32_t)payload[9] << 24);
 
     taskENTER_CRITICAL();
-    pc_data.vx_set_mps = vx_mps;
-    pc_data.vy_set_mps = vy_mps;
-    pc_data.velocity_echo_ms = echo_ms;
-    pc_data.velocity_update_ms = HAL_GetTick();
-    ++pc_data.velocity_rx_count;
+    if (FLOW_RUN_XY_VELOCITY_ENABLE) {
+        pc_data.vx_set_mps = target_x * 0.001f;
+        pc_data.vy_set_mps = target_y * 0.001f;
+    } else {
+        pc_data.flow_pitch_set_deg = target_x * 0.01f;
+        pc_data.flow_roll_set_deg = target_y * 0.01f;
+    }
+    pc_data.flow_target_echo_ms = echo_ms;
+    pc_data.flow_target_update_ms = HAL_GetTick();
+    ++pc_data.flow_target_rx_count;
     taskEXIT_CRITICAL();
 }
 
@@ -392,7 +402,7 @@ void Mavlink_Msg_Handle(mavlink_message_t msg)
 	    mavlink_num_test++;
 		break;
     case MAVLINK_MSG_ID_V2_EXTENSION:
-        handle_pc_velocity_extension(&msg);
+        handle_pc_flow_extension(&msg);
         break;
 	case MAVLINK_MSG_ID_RC_CHANNELS_OVERRIDE:
 	{
@@ -503,11 +513,49 @@ static void send_yaw_debug(void)
     }
 }
 
+static void send_flow_vector(mavlink_status_t *tx_status, uint8_t compid, const char *name,
+                             uint64_t sample_us, float vx, float vy, bool valid)
+{
+    mavlink_message_t msg;
+    uint8_t buffer[MAVLINK_MSG_ID_DEBUG_VECT_LEN + MAVLINK_NUM_NON_PAYLOAD_BYTES];
+    mavlink_msg_debug_vect_pack_status(mavlink_system.sysid, compid, tx_status, &msg,
+                                       name, sample_us, vx, vy, valid ? 1.0f : 0.0f);
+    uint16_t length = mavlink_msg_to_send_buffer(buffer, &msg);
+    mavlink_send_uart_bytes(MAVLINK_COMM_0, buffer, length);
+}
+
+static void send_qgc_flow_debug(uint32_t now)
+{
+    static const char setpoint_name[10] = "FLOW_SP";
+    static const char feedback_name[10] = "FLOW_EST";
+    /* QGC 按消息 ID 和组件 ID 分组。两个调试组件使用独立的发送序号。 */
+    static mavlink_status_t setpoint_status;
+    static mavlink_status_t feedback_status;
+
+    OpticalFlow_Data_t flow;
+    mavlink_flow_get_snapshot(&flow, now);
+    const OpticalFlow_Control_t *control = &flow.control;
+    bool feedback_valid = control->velocity_valid &&
+                          (uint32_t)(now - control->update_ms) <= FLOW_TIMEOUT_MS &&
+                          (uint32_t)(now - control->velocity_sample_ms) <= FLOW_TIMEOUT_MS;
+    bool setpoint_valid = feedback_valid && control->xy_pid_active;
+    uint64_t sample_us = (uint64_t)control->update_ms * 1000U;
+
+    send_flow_vector(&setpoint_status, MAV_COMP_ID_USER1, setpoint_name, sample_us,
+                     setpoint_valid ? control->vx_set_mps : NAN,
+                     setpoint_valid ? control->vy_set_mps : NAN, setpoint_valid);
+    send_flow_vector(&feedback_status, MAV_COMP_ID_USER2, feedback_name, sample_us,
+                     feedback_valid ? control->vx_feedback_mps : NAN,
+                     feedback_valid ? control->vy_feedback_mps : NAN, feedback_valid);
+}
+
 void mavlink_task(void const *pvParameters)
 {
     (void)pvParameters;
-    uint32_t last_yaw_ms = HAL_GetTick();
-    uint32_t last_heartbeat_ms = last_yaw_ms - MAVLINK_HEARTBEAT_PERIOD_MS;  /* 启动立即发心跳 */
+    const uint32_t telemetry_period_ms = MAVLINK_QGC_FLOW_DEBUG_ENABLE
+        ? MAVLINK_QGC_FLOW_DEBUG_PERIOD_MS : MAVLINK_YAW_PERIOD_MS;
+    uint32_t last_telemetry_ms = HAL_GetTick();
+    uint32_t last_heartbeat_ms = last_telemetry_ms - MAVLINK_HEARTBEAT_PERIOD_MS;  /* 启动立即发心跳 */
     while (1)
     {
         Loop_Mavlink_Parse();
@@ -519,10 +567,14 @@ void mavlink_task(void const *pvParameters)
                 MAV_AUTOPILOT_GENERIC, 0, 0, MAV_STATE_UNINIT);
         }
 
-        elapsed = now - last_yaw_ms;
-        if (elapsed >= MAVLINK_YAW_PERIOD_MS) {
-            last_yaw_ms += elapsed - elapsed % MAVLINK_YAW_PERIOD_MS;
-            send_yaw_debug();
+        elapsed = now - last_telemetry_ms;
+        if (elapsed >= telemetry_period_ms) {
+            last_telemetry_ms += elapsed - elapsed % telemetry_period_ms;
+            if (MAVLINK_QGC_FLOW_DEBUG_ENABLE) {
+                send_qgc_flow_debug(now);
+            } else {
+                send_yaw_debug();
+            }
         }
         vTaskDelay(pdMS_TO_TICKS(10));
     }
